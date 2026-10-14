@@ -1,2 +1,2 @@
 requests>=2.28
-azure-identity>=1.15  # nur fuer Login im Browser bzw. per az login
+azure-identity>=1.15  # only for browser login or az login
