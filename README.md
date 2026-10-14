@@ -39,7 +39,7 @@ The identity lookup needs the **Identity: Read** scope when you use a PAT; witho
 
 There are two options:
 
-1. **Personal Access Token (PAT).** Create the token at https://dev.azure.com/<organization>/_usersSettings/tokens, select your organization (not "All accessible organizations") and the scopes **Code: Read** and **Identity: Read**.
+1. **Personal Access Token (PAT).** Create the token at https://dev.azure.com/<organization>/_usersSettings/tokens, select your organization (not "All accessible organizations") and the scopes **Code: Read**, **Work Items: Read**, **Project and Team: Read** and **Identity: Read**.
    ```bash
    export AZURE_DEVOPS_PAT=...        # Windows: set AZURE_DEVOPS_PAT=...
    ```
@@ -54,6 +54,9 @@ python adobrowser.py repos                          # all repos
 python adobrowser.py repos --sort commit            # newest commit (any branch) first, with author and email
 python adobrowser.py authors                        # all author name/email combinations
 python adobrowser.py authors MyRepo                 # only one repo
+python adobrowser.py workitems                      # work items changed in the last 14 days
+python adobrowser.py workitems --days 30            # ... in the last 30 days
+python adobrowser.py workitems --area "MyProject\Team A"  # only this area path and below
 python adobrowser.py branches MyRepo                # branches
 python adobrowser.py ls  MyRepo /                   # list a folder
 python adobrowser.py ls  MyRepo /src --branch dev
@@ -61,6 +64,10 @@ python adobrowser.py cat MyRepo /README.md          # print a file
 ```
 
 The values from `config.ini` can be overridden with the environment variables `AZURE_DEVOPS_ORG` and `AZURE_DEVOPS_PROJECT` and with the options `--org` and `--project` (precedence: option, then environment variable, then `config.ini`). Use `--config PATH` to use a different config file.
+
+### Boards
+
+`workitems` shows on which board each work item appears, as `Team: Board` (e.g. `Team A: Stories`, or `Team A: Taskboard` for tasks on the sprint taskboard). It reads every team's area paths and backlog levels and matches them against the work item's area path and type. If several teams cover the area path, all their boards are listed. Iteration settings are not taken into account. With a PAT this needs the **Project and Team: Read** scope.
 
 ## Tests
 

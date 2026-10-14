@@ -29,6 +29,10 @@ DEFAULT_CONFIG = Path(__file__).with_name("config.ini")
 AUTH_RECORD = Path.home() / ".adobrowser" / "auth_record.json"
 
 LastCommit = namedtuple("LastCommit", "date branch author email")
+WORK_ITEM_FIELDS = [
+    "System.Id", "System.WorkItemType", "System.State", "System.Title",
+    "System.ChangedDate", "System.ChangedBy", "System.AssignedTo", "System.AreaPath",
+]
 # Local bare clones (commit history only) used by the "authors" command
 GIT_CACHE = Path.home() / ".adobrowser" / "git"
 
@@ -144,13 +148,21 @@ class AzureDevOpsClient:
         self.org = org
         self.project = project
         self.base = f"https://dev.azure.com/{org}/{project}/_apis/git"
+        self.wit = f"https://dev.azure.com/{org}/{project}/_apis/wit"
+        self.project_url = f"https://dev.azure.com/{org}/{project}"
 
     def _get(self, path, **params):
         return self._get_url(f"{self.base}{path}", **params)
 
     def _get_url(self, url, **params):
+        return self._request("GET", url, params=params)
+
+    def _post_url(self, url, body):
+        return self._request("POST", url, params={}, json=body)
+
+    def _request(self, method, url, params, **kwargs):
         params["api-version"] = API_VERSION
-        r = self.session.get(url, params=params)
+        r = self.session.request(method, url, params=params, **kwargs)
         if r.status_code in (401, 203):
             # 203 = login page instead of JSON, typical for a wrong/expired token
             raise PermissionError("Authentication failed (check your token).")
@@ -230,6 +242,62 @@ class AzureDevOpsClient:
                     counts[key] = counts.get(key, 0) + 1
         return counts
 
+    def changed_work_items(self, days=14, area=None, batch_size=200):
+        """Return work items of the project changed in the last `days` days, newest first.
+
+        With `area`, only items in that area path or below it are returned.
+        One WIQL query returns the IDs, then the fields are read in batches of 200.
+        """
+        area_filter = ""
+        if area:
+            # WIQL string literals escape a single quote by doubling it
+            area_filter = " AND [System.AreaPath] UNDER '{}'".format(area.replace("'", "''"))
+        query = (
+            "SELECT [System.Id] FROM WorkItems"
+            " WHERE [System.TeamProject] = @project"
+            f" AND [System.ChangedDate] >= @today - {int(days)}"
+            f"{area_filter}"
+            " ORDER BY [System.ChangedDate] DESC"
+        )
+        ids = [w["id"] for w in self._post_url(f"{self.wit}/wiql", {"query": query}).json()["workItems"]]
+        items = []
+        for i in range(0, len(ids), batch_size):
+            body = {"ids": ids[i:i + batch_size], "fields": WORK_ITEM_FIELDS}
+            items += self._post_url(f"{self.wit}/workitemsbatch", body).json()["value"]
+        return sorted(items, key=lambda w: w["fields"]["System.ChangedDate"], reverse=True)
+
+    def team_boards(self, workers=8):
+        """Return the board setup of every team in the project.
+
+        [{"team": name, "areas": [(area path, include children)],
+          "levels": [(board name, backlog type, {work item types})]}]
+        Teams whose team field is not the area path are skipped.
+        """
+        teams = self._get_url(
+            f"https://dev.azure.com/{self.org}/_apis/projects/{self.project}/teams", **{"$top": 1000}
+        ).json()["value"]
+
+        def fetch(team):
+            base = f"{self.project_url}/{team['id']}/_apis/work"
+            fields = self._get_url(f"{base}/teamsettings/teamfieldvalues").json()
+            if fields["field"]["referenceName"] != "System.AreaPath":
+                return None
+            # The team's backlog levels already reflect its "bugs on backlog/taskboard" setting
+            backlogs = self._get_url(f"{base}/backlogs").json()["value"]
+            return {
+                "team": team["name"],
+                "areas": [(v["value"], v["includeChildren"]) for v in fields["values"]],
+                "levels": [
+                    ("Taskboard" if b.get("type") == "task" else b["name"], b.get("type"),
+                     {t["name"] for t in b["workItemTypes"]})
+                    for b in backlogs if not b.get("isHidden")
+                ],
+            }
+
+        with ThreadPoolExecutor(workers) as pool:
+            return sorted((t for t in pool.map(fetch, teams) if t), key=lambda t: t["team"].lower())
+
+
     def display_name(self, email):
         """Return the Azure DevOps display name of the user with this email, or None."""
         r = self._get_url(
@@ -294,6 +362,21 @@ class AzureDevOpsClient:
         ).json()["content"]
 
 
+def boards_for(fields, teams):
+    """Return ["Team: Board", ...] for the boards a work item shows up on."""
+    area = fields.get("System.AreaPath", "").lower()
+    kind = fields.get("System.WorkItemType")
+    boards = []
+    for team in teams:
+        in_area = any(
+            area == path.lower() or (children and area.startswith(path.lower() + "\\"))
+            for path, children in team["areas"]
+        )
+        if in_area:
+            boards += [f"{team['team']}: {name}" for name, _, types in team["levels"] if kind in types]
+    return boards
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Browse Azure DevOps repos")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="path to config.ini")
@@ -307,6 +390,9 @@ def main(argv=None):
                        help="sort by name or by newest commit in any branch (newest first)")
     au = sub.add_parser("authors", help="list all distinct commit author name/email combinations")
     au.add_argument("repo", nargs="?", help="only this repo (default: all repos)")
+    wi = sub.add_parser("workitems", help="list work items changed recently")
+    wi.add_argument("--days", type=int, default=14, help="changed within this many days (default: 14)")
+    wi.add_argument("--area", help="only this area path and its sub-areas, e.g. 'MyProject\\Team A'")
     b = sub.add_parser("branches", help="list branches of a repo")
     b.add_argument("repo")
     ls = sub.add_parser("ls", help="list folder contents")
@@ -352,6 +438,21 @@ def main(argv=None):
         print(f"{'COMMON NAME':<25} {'GIT NAME':<25} {'EMAIL':<35} COMMITS")
         for (author, email), count in rows:
             print(f"{names[author, email]:<25} {author:<25} {email:<35} {count:>7}")
+    elif args.cmd == "workitems":
+        def person(field):
+            # Identity fields are objects; unassigned items have no AssignedTo field
+            return (field or {}).get("displayName", "")
+
+        print(f"{'ID':>7}  {'CHANGED':<16}  {'TYPE':<12} {'STATE':<12} {'CHANGED BY':<22} {'ASSIGNED TO':<22} {'AREA PATH':<30} {'BOARD':<30} TITLE")
+        items = client.changed_work_items(args.days, args.area)
+        teams = client.team_boards() if items else []
+        for item in items:
+            f = item["fields"]
+            board = ", ".join(boards_for(f, teams)) or "-"
+            changed = datetime.fromisoformat(f["System.ChangedDate"][:19]).strftime("%Y-%m-%d %H:%M")
+            print(f"{item['id']:>7}  {changed:<16}  {f['System.WorkItemType'][:12]:<12} {f['System.State'][:12]:<12} "
+                  f"{person(f.get('System.ChangedBy'))[:22]:<22} {person(f.get('System.AssignedTo'))[:22]:<22} "
+                  f"{f.get('System.AreaPath', ''):<30} {board:<30} {f['System.Title']}")
     elif args.cmd == "branches":
         for name in client.list_branches(args.repo):
             print(name)
