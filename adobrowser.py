@@ -32,7 +32,12 @@ LastCommit = namedtuple("LastCommit", "date branch author email")
 WORK_ITEM_FIELDS = [
     "System.Id", "System.WorkItemType", "System.State", "System.Title",
     "System.ChangedDate", "System.ChangedBy", "System.AssignedTo", "System.AreaPath",
+    "Microsoft.VSTS.Scheduling.OriginalEstimate",
 ]
+# States shown by "workitems --current"
+CURRENT_STATES = ["Active", "Resolved", "Closed"]
+# States shown by "workitems --planned"
+PLANNED_STATES = ["UP-NEXT"]
 # Local bare clones (commit history only) used by the "authors" command
 GIT_CACHE = Path.home() / ".adobrowser" / "git"
 
@@ -46,11 +51,14 @@ def load_config(path=DEFAULT_CONFIG):
     parser.read(path, encoding="utf-8")
     section = parser["azure_devops"] if parser.has_section("azure_devops") else {}
     aliases = parser["aliases"] if parser.has_section("aliases") else {}
+    blacklist = parser.get("blacklist", "repos", fallback="")
     return {
         "org": os.environ.get("AZURE_DEVOPS_ORG", section.get("organization")),
         "project": os.environ.get("AZURE_DEVOPS_PROJECT", section.get("project")),
         # Commit author name or email (lowercase) -> common name
         "aliases": {key.lower(): value for key, value in aliases.items()},
+        # Repo names or IDs (lowercase) to skip; separated by commas or newlines
+        "blacklist": {name.strip().lower() for name in blacklist.replace(",", "\n").splitlines() if name.strip()},
     }
 
 
@@ -143,8 +151,9 @@ def git_log_authors(url, path, env):
 
 
 class AzureDevOpsClient:
-    def __init__(self, session, org, project):
+    def __init__(self, session, org, project, blacklist=()):
         self.session = session
+        self.blacklist = {name.lower() for name in blacklist}
         self.org = org
         self.project = project
         self.base = f"https://dev.azure.com/{org}/{project}/_apis/git"
@@ -170,7 +179,9 @@ class AzureDevOpsClient:
         return r
 
     def list_repos(self):
-        return self._get("/repositories").json()["value"]
+        """Return the repos of the project, without those in the blacklist."""
+        repos = self._get("/repositories").json()["value"]
+        return [r for r in repos if not {r.get("name", "").lower(), r.get("id", "").lower()} & self.blacklist]
 
     def last_commit(self, repo):
         """Return the LastCommit of the newest commit across all branches, or None.
@@ -213,7 +224,7 @@ class AzureDevOpsClient:
 
         Each repo is kept as a bare, blob-less clone in cache_dir (commits and
         trees only, no file contents) and updated with `git fetch` on later runs.
-        All branches are read. Returns {(name, email): commit count}.
+        All branches are read. Returns {(name, email): {repo name: commit count}}.
         """
         repos = [r for r in self.list_repos() if repo in (None, r["name"], r["id"])]
         if repo and not repos:
@@ -239,19 +250,24 @@ class AzureDevOpsClient:
                 if progress:
                     progress(f"[{done}/{len(repos)}] {r['name']}")
                 for key in log:
-                    counts[key] = counts.get(key, 0) + 1
+                    per_repo = counts.setdefault(key, {})
+                    per_repo[r["name"]] = per_repo.get(r["name"], 0) + 1
         return counts
 
-    def changed_work_items(self, days=14, area=None, batch_size=200):
+    def changed_work_items(self, days=14, area=None, states=None, batch_size=200):
         """Return work items of the project changed in the last `days` days, newest first.
 
-        With `area`, only items in that area path or below it are returned.
+        With `area`, only items in that area path or below it are returned;
+        with `states`, only items in one of these states.
         One WIQL query returns the IDs, then the fields are read in batches of 200.
         """
         area_filter = ""
         if area:
             # WIQL string literals escape a single quote by doubling it
             area_filter = " AND [System.AreaPath] UNDER '{}'".format(area.replace("'", "''"))
+        if states:
+            area_filter += " AND [System.State] IN ({})".format(
+                ", ".join("'{}'".format(s.replace("'", "''")) for s in states))
         query = (
             "SELECT [System.Id] FROM WorkItems"
             " WHERE [System.TeamProject] = @project"
@@ -390,9 +406,15 @@ def main(argv=None):
                        help="sort by name or by newest commit in any branch (newest first)")
     au = sub.add_parser("authors", help="list all distinct commit author name/email combinations")
     au.add_argument("repo", nargs="?", help="only this repo (default: all repos)")
+    au.add_argument("--summary", action="store_true",
+                    help="one line per common name with total commits and the repos they committed to")
     wi = sub.add_parser("workitems", help="list work items changed recently")
     wi.add_argument("--days", type=int, default=14, help="changed within this many days (default: 14)")
     wi.add_argument("--area", help="only this area path and its sub-areas, e.g. 'MyProject\\Team A'")
+    wi.add_argument("--current", action="store_true",
+                    help="only items in state " + ", ".join(CURRENT_STATES))
+    wi.add_argument("--planned", action="store_true",
+                    help="only items in state " + ", ".join(PLANNED_STATES) + " (with --current: both)")
     b = sub.add_parser("branches", help="list branches of a repo")
     b.add_argument("repo")
     ls = sub.add_parser("ls", help="list folder contents")
@@ -410,7 +432,7 @@ def main(argv=None):
     project = args.project or config["project"]
     if not org or not project:
         sys.exit(f"Organization and project missing: set them in {args.config} or pass --org/--project.")
-    client = AzureDevOpsClient(make_session(args.auth), org, project)
+    client = AzureDevOpsClient(make_session(args.auth), org, project, config["blacklist"])
 
     if args.cmd == "repos" and args.sort == "commit":
         results = client.list_repos_by_commit()
@@ -434,17 +456,34 @@ def main(argv=None):
         names = client.resolve_authors(
             [LastCommit(None, None, author, email) for author, email in counts], config["aliases"]
         )
-        rows = sorted(counts.items(), key=lambda kv: (names[kv[0]].lower(), kv[0][1].lower(), kv[0][0].lower()))
-        print(f"{'COMMON NAME':<25} {'GIT NAME':<25} {'EMAIL':<35} COMMITS")
-        for (author, email), count in rows:
-            print(f"{names[author, email]:<25} {author:<25} {email:<35} {count:>7}")
+        if args.summary:
+            # Merge all name/email combinations of a person: {common name: {repo: commits}}
+            people = {}
+            for key, per_repo in counts.items():
+                merged = people.setdefault(names[key], {})
+                for repo, count in per_repo.items():
+                    merged[repo] = merged.get(repo, 0) + count
+            print(f"{'COMMON NAME':<25} {'COMMITS':>7}  REPOS")
+            for name, per_repo in sorted(people.items(), key=lambda kv: kv[0].lower()):
+                repos = ", ".join(sorted(per_repo, key=str.lower))
+                print(f"{name:<25} {sum(per_repo.values()):>7}  {repos}")
+        else:
+            rows = sorted(counts.items(), key=lambda kv: (names[kv[0]].lower(), kv[0][1].lower(), kv[0][0].lower()))
+            print(f"{'COMMON NAME':<25} {'GIT NAME':<25} {'EMAIL':<35} COMMITS")
+            for (author, email), per_repo in rows:
+                print(f"{names[author, email]:<25} {author:<25} {email:<35} {sum(per_repo.values()):>7}")
     elif args.cmd == "workitems":
         def person(field):
             # Identity fields are objects; unassigned items have no AssignedTo field
             return (field or {}).get("displayName", "")
 
-        print(f"{'ID':>7}  {'CHANGED':<16}  {'TYPE':<12} {'STATE':<12} {'CHANGED BY':<22} {'ASSIGNED TO':<22} {'AREA PATH':<30} {'BOARD':<30} TITLE")
-        items = client.changed_work_items(args.days, args.area)
+        def effort(value):
+            # Original estimate in hours; missing if never set or not on this work item type
+            return "" if value is None else f"{value:g}"
+
+        print(f"{'ID':>7}  {'CHANGED':<16}  {'TYPE':<12} {'STATE':<12} {'CHANGED BY':<22} {'ASSIGNED TO':<22} {'EFFORT':>6}  {'AREA PATH':<30} {'BOARD':<30} TITLE")
+        states = (CURRENT_STATES if args.current else []) + (PLANNED_STATES if args.planned else [])
+        items = client.changed_work_items(args.days, args.area, states)
         teams = client.team_boards() if items else []
         for item in items:
             f = item["fields"]
@@ -452,7 +491,7 @@ def main(argv=None):
             changed = datetime.fromisoformat(f["System.ChangedDate"][:19]).strftime("%Y-%m-%d %H:%M")
             print(f"{item['id']:>7}  {changed:<16}  {f['System.WorkItemType'][:12]:<12} {f['System.State'][:12]:<12} "
                   f"{person(f.get('System.ChangedBy'))[:22]:<22} {person(f.get('System.AssignedTo'))[:22]:<22} "
-                  f"{f.get('System.AreaPath', ''):<30} {board:<30} {f['System.Title']}")
+                  f"{effort(f.get('Microsoft.VSTS.Scheduling.OriginalEstimate')):>6}  {f.get('System.AreaPath', ''):<30} {board:<30} {f['System.Title']}")
     elif args.cmd == "branches":
         for name in client.list_branches(args.repo):
             print(name)

@@ -18,6 +18,17 @@ organization = my-organization
 project = my-project
 ```
 
+### Ignoring repos
+
+Repos listed under `repos` in the optional `[blacklist]` section are skipped by `repos`, `repos --sort commit` and `authors`: they are not listed, queried or cloned. Give names or IDs, case-insensitive, separated by commas or one per line:
+
+```ini
+[blacklist]
+repos = ZephyrFork, OldArchive
+```
+
+`branches`, `ls` and `cat` still work on a blacklisted repo, since you name it explicitly.
+
 ### Author names
 
 `repos --sort commit` shows the author of each repo's newest commit. Git stores only the name and email from the author's git config, so one person can appear under several aliases. The tool merges them into one name in this order:
@@ -54,9 +65,12 @@ python adobrowser.py repos                          # all repos
 python adobrowser.py repos --sort commit            # newest commit (any branch) first, with author and email
 python adobrowser.py authors                        # all author name/email combinations
 python adobrowser.py authors MyRepo                 # only one repo
+python adobrowser.py authors --summary              # one line per person: total commits and repos
 python adobrowser.py workitems                      # work items changed in the last 14 days
 python adobrowser.py workitems --days 30            # ... in the last 30 days
 python adobrowser.py workitems --area "MyProject\Team A"  # only this area path and below
+python adobrowser.py workitems --current            # only Active, Resolved and Closed items
+python adobrowser.py workitems --planned            # only UP-NEXT items (combine with --current for both)
 python adobrowser.py branches MyRepo                # branches
 python adobrowser.py ls  MyRepo /                   # list a folder
 python adobrowser.py ls  MyRepo /src --branch dev

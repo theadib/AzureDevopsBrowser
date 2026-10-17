@@ -32,6 +32,13 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(url, "https://dev.azure.com/my-org/my-project/_apis/git/repositories")
         self.assertEqual(params["api-version"], "7.1")
 
+    def test_list_repos_skips_blacklist(self):
+        client = adobrowser.AzureDevOpsClient(self.session, "my-org", "my-project", {"Fork", "ID-2"})
+        self.session.request.return_value = fake_response(
+            {"value": [{"name": "A", "id": "id-1"}, {"name": "fork", "id": "id-3"}, {"name": "B", "id": "id-2"}]}
+        )
+        self.assertEqual(client.list_repos(), [{"name": "A", "id": "id-1"}])
+
     def test_branches_strip_prefix(self):
         self.session.request.return_value = fake_response(
             {"value": [{"name": "refs/heads/main"}, {"name": "refs/heads/feature/x"}]}
@@ -188,12 +195,12 @@ class GitAuthorsTest(unittest.TestCase):
             client = adobrowser.AzureDevOpsClient(session, "my-org", "my-project")
             cache = Path(tmp) / "cache"
 
-            self.assertEqual(client.list_authors(cache_dir=cache), {jane: 2, jd: 1})
+            self.assertEqual(client.list_authors(cache_dir=cache), {jane: {"A": 2}, jd: {"A": 1}})
             self.assertTrue((cache / "my-org" / "my-project" / "a.git" / "HEAD").exists())
 
             # Second run fetches into the existing clone
             self.git("commit", "-q", "--allow-empty", "-m", "4", cwd=src, author=jd)
-            self.assertEqual(client.list_authors(cache_dir=cache), {jane: 2, jd: 2})
+            self.assertEqual(client.list_authors(cache_dir=cache), {jane: {"A": 2}, jd: {"A": 2}})
 
     def test_git_env_passes_pat_as_header(self):
         env = adobrowser.git_env(mock.Mock(auth=("", "secret")))
@@ -254,11 +261,13 @@ class ConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.ini"
             path.write_text("[azure_devops]\norganization = ini-org\nproject = ini-project\n"
-                            "[aliases]\njd = Jane Doe\nMe@Example.com = Jane Doe\n")
+                            "[aliases]\njd = Jane Doe\nMe@Example.com = Jane Doe\n"
+                            "[blacklist]\nrepos = Old-Repo, Fork\n  Archive\n")
             with mock.patch.dict("os.environ", {}, clear=True):
                 self.assertEqual(adobrowser.load_config(path), {
                     "org": "ini-org", "project": "ini-project",
                     "aliases": {"jd": "Jane Doe", "me@example.com": "Jane Doe"},
+                    "blacklist": {"old-repo", "fork", "archive"},
                 })
             with mock.patch.dict("os.environ", {"AZURE_DEVOPS_ORG": "env-org"}, clear=True):
                 self.assertEqual(adobrowser.load_config(path)["org"], "env-org")
@@ -266,7 +275,7 @@ class ConfigTest(unittest.TestCase):
     def test_missing_file_gives_none(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(adobrowser.load_config(Path("/nonexistent/config.ini")),
-                             {"org": None, "project": None, "aliases": {}})
+                             {"org": None, "project": None, "aliases": {}, "blacklist": set()})
 
 
 class CliTest(unittest.TestCase):
@@ -282,6 +291,23 @@ class CliTest(unittest.TestCase):
         self.assertIn("MyRepo", out.getvalue())
         self.assertIn("main", out.getvalue())
 
+    def test_authors_summary_merges_aliases_and_lists_repos(self):
+        counts = {("Jane", "jane@corp.com"): {"Web": 3, "api": 1},
+                  ("jd", "jane@home.org"): {"Tools": 2, "Web": 1},
+                  ("Bob", "bob@corp.com"): {"api": 4}}
+        names = {("Jane", "jane@corp.com"): "Jane Doe", ("jd", "jane@home.org"): "Jane Doe",
+                 ("Bob", "bob@corp.com"): "Bob"}
+        out = io.StringIO()
+        with mock.patch.object(adobrowser, "make_session"), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "list_authors", return_value=counts), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "resolve_authors", return_value=names), \
+                redirect_stdout(out):
+            adobrowser.main(["--config", "/nonexistent/config.ini", "--org", "my-org",
+                             "--project", "my-project", "authors", "--summary"])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[1].split(), ["Bob", "4", "api"])
+        self.assertEqual(lines[2].split(), ["Jane", "Doe", "7", "api,", "Tools,", "Web"])
+
 
     def test_workitems_output(self):
         session = mock.Mock()
@@ -291,6 +317,7 @@ class CliTest(unittest.TestCase):
                 "System.WorkItemType": "Bug", "System.State": "Active", "System.Title": "Fix login",
                 "System.ChangedDate": "2025-03-05T08:30:12.345Z",
                 "System.ChangedBy": {"displayName": "Jane Doe"}, "System.AreaPath": "my-project\\Team A",
+                "Microsoft.VSTS.Scheduling.OriginalEstimate": 4.5,
             }}]}),
         ]
         teams = [{"team": "Team A", "areas": [("my-project\\Team A", True)],
@@ -300,13 +327,14 @@ class CliTest(unittest.TestCase):
                 mock.patch.object(adobrowser.AzureDevOpsClient, "team_boards", return_value=teams), \
                 redirect_stdout(out):
             adobrowser.main(["--org", "my-org", "--project", "my-project", "workitems", "--days", "3",
-                           "--area", "my-project\\Team's A"])
+                           "--area", "my-project\\Team's A", "--current", "--planned"])
         line = out.getvalue().splitlines()[1]
-        for text in ("42", "2025-03-05 08:30", "Bug", "Active", "Jane Doe", "my-project\\Team A", "Team A: Bugs", "Fix login"):
+        for text in ("42", "2025-03-05 08:30", "Bug", "Active", "Jane Doe", "4.5", "my-project\\Team A", "Team A: Bugs", "Fix login"):
             self.assertIn(text, line)
         query = session.request.call_args_list[0].kwargs["json"]["query"]
         self.assertIn("@today - 3", query)
         self.assertIn("[System.AreaPath] UNDER 'my-project\\Team''s A'", query)
+        self.assertIn("[System.State] IN ('Active', 'Resolved', 'Closed', 'UP-NEXT')", query)
 
 if __name__ == "__main__":
     unittest.main()
