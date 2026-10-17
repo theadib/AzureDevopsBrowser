@@ -63,6 +63,8 @@ There are two options:
 ```bash
 python adobrowser.py repos                          # all repos
 python adobrowser.py repos --sort commit            # newest commit (any branch) first, with author and email
+python adobrowser.py repos --days 30                # only repos with a commit (any branch) in the last 30 days
+python adobrowser.py repos --days 7 --author "Jane Doe"  # commits of Jane Doe (common name) in the last 7 days
 python adobrowser.py authors                        # all author name/email combinations
 python adobrowser.py authors MyRepo                 # only one repo
 python adobrowser.py authors --summary              # one line per person: total commits and repos

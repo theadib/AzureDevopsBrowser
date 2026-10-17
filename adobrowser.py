@@ -15,7 +15,7 @@ import subprocess
 import sys
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -29,6 +29,7 @@ DEFAULT_CONFIG = Path(__file__).with_name("config.ini")
 AUTH_RECORD = Path.home() / ".adobrowser" / "auth_record.json"
 
 LastCommit = namedtuple("LastCommit", "date branch author email")
+Commit = namedtuple("Commit", "date branch author email id message")
 WORK_ITEM_FIELDS = [
     "System.Id", "System.WorkItemType", "System.State", "System.Title",
     "System.ChangedDate", "System.ChangedBy", "System.AssignedTo", "System.AreaPath",
@@ -40,6 +41,11 @@ CURRENT_STATES = ["Active", "Resolved", "Closed"]
 PLANNED_STATES = ["UP-NEXT"]
 # Local bare clones (commit history only) used by the "authors" command
 GIT_CACHE = Path.home() / ".adobrowser" / "git"
+
+
+def parse_date(text):
+    """Parse an ISO 8601 date from the API (\"Z\" suffix) into an aware datetime."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
 def load_config(path=DEFAULT_CONFIG):
@@ -183,22 +189,64 @@ class AzureDevOpsClient:
         repos = self._get("/repositories").json()["value"]
         return [r for r in repos if not {r.get("name", "").lower(), r.get("id", "").lower()} & self.blacklist]
 
-    def last_commit(self, repo):
-        """Return the LastCommit of the newest commit across all branches, or None.
-
-        Uses the branch statistics, which contain the head commit of every branch.
-        """
+    def branch_heads(self, repo):
+        """Return a LastCommit for the head commit of every branch, from the branch statistics."""
         stats = self._get(f"/repositories/{repo}/stats/branches").json()["value"]
-        heads = [
+        return [
             LastCommit(
-                datetime.fromisoformat(b["commit"]["committer"]["date"].replace("Z", "+00:00")),
+                parse_date(b["commit"]["committer"]["date"]),
                 b["name"],
                 b["commit"].get("author", {}).get("name", ""),
                 b["commit"].get("author", {}).get("email", ""),
             )
             for b in stats
         ]
-        return max(heads, key=lambda h: h.date, default=None)
+
+    def last_commit(self, repo):
+        """Return the LastCommit of the newest commit across all branches, or None."""
+        return max(self.branch_heads(repo), key=lambda h: h.date, default=None)
+
+    def commits_since(self, repo, since, page_size=1000):
+        """Return the Commits of all branches committed at or after `since`, newest first.
+
+        Only branches whose head commit is that recent are read. A commit that is on
+        several branches is listed once, with the branch whose head is newest.
+        """
+        heads = sorted((h for h in self.branch_heads(repo) if h.date >= since), key=lambda h: h.date, reverse=True)
+        commits = {}
+        for head in heads:
+            skip = 0
+            while True:
+                page = self._get(f"/repositories/{repo}/commits", **{
+                    "searchCriteria.itemVersion.version": head.branch,
+                    "searchCriteria.itemVersion.versionType": "branch",
+                    "searchCriteria.fromDate": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "searchCriteria.$top": page_size,
+                    "searchCriteria.$skip": skip,
+                }).json()["value"]
+                for c in page:
+                    if c["commitId"] not in commits:
+                        commits[c["commitId"]] = Commit(
+                            parse_date(c["committer"]["date"]), head.branch,
+                            c.get("author", {}).get("name", ""), c.get("author", {}).get("email", ""),
+                            c["commitId"], (c.get("comment") or "").split("\n", 1)[0],
+                        )
+                if len(page) < page_size:
+                    break
+                skip += page_size
+        return sorted(commits.values(), key=lambda c: c.date, reverse=True)
+
+    def list_commits_since(self, repos, since, workers=8):
+        """Return [(repo, Commit)] of all given repos since `since`, newest first."""
+        def fetch(repo):
+            try:
+                return [(repo, c) for c in self.commits_since(repo["id"], since)]
+            except requests.HTTPError:
+                return []
+
+        with ThreadPoolExecutor(workers) as pool:
+            results = [rc for rcs in pool.map(fetch, repos) for rc in rcs]
+        return sorted(results, key=lambda rc: rc[1].date, reverse=True)
 
     def list_repos_by_commit(self, workers=8):
         """Return [(repo, LastCommit or None)], newest commit first."""
@@ -404,6 +452,9 @@ def main(argv=None):
     repos = sub.add_parser("repos", help="list repos in the project")
     repos.add_argument("--sort", choices=["name", "commit"], default="name",
                        help="sort by name or by newest commit in any branch (newest first)")
+    repos.add_argument("--days", type=int,
+                       help="only repos whose newest commit (any branch) is within this many days")
+    repos.add_argument("--author", help="list the commits of this common name instead (requires --days)")
     au = sub.add_parser("authors", help="list all distinct commit author name/email combinations")
     au.add_argument("repo", nargs="?", help="only this repo (default: all repos)")
     au.add_argument("--summary", action="store_true",
@@ -427,6 +478,8 @@ def main(argv=None):
     cat.add_argument("--branch")
 
     args = p.parse_args(argv)
+    if args.cmd == "repos" and args.author and args.days is None:
+        p.error("--author requires --days")
     config = load_config(args.config)
     org = args.org or config["org"]
     project = args.project or config["project"]
@@ -434,8 +487,21 @@ def main(argv=None):
         sys.exit(f"Organization and project missing: set them in {args.config} or pass --org/--project.")
     client = AzureDevOpsClient(make_session(args.auth), org, project, config["blacklist"])
 
-    if args.cmd == "repos" and args.sort == "commit":
+    if args.cmd == "repos" and (args.sort == "commit" or args.days is not None):
         results = client.list_repos_by_commit()
+        if args.days is not None:
+            since = datetime.now(timezone.utc) - timedelta(days=args.days)
+            results = [(repo, last) for repo, last in results if last and last.date >= since]
+        if args.author:
+            commits = client.list_commits_since([repo for repo, _ in results], since)
+            names = client.resolve_authors([c for _, c in commits], config["aliases"])
+            for repo, c in commits:
+                if names[c.author, c.email].lower() == args.author.lower():
+                    print(f"{c.date.strftime('%Y-%m-%d %H:%M'):<17} {repo['name']:<40} {c.branch:<25} "
+                          f"{c.id[:8]}  {c.message}")
+            return
+        if args.sort == "name":
+            results.sort(key=lambda r: r[0]["name"].lower())
         names = client.resolve_authors([last for _, last in results], config["aliases"])
         for repo, last in results:
             if last:

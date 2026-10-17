@@ -72,10 +72,29 @@ GET https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repoId}/stats/
 ```
 
 - **Method:** `last_commit` (called by `list_repos_by_commit` once per repo, in parallel)
-- **Used by:** `repos --sort commit`
+- **Used by:** `repos --sort commit`, `repos --days`
 - **Response fields read:** `value[].name`, `value[].commit.committer.date`, `value[].commit.author.name`, `value[].commit.author.email`
 - **Logic:** the response contains the head commit of every branch. The tool takes the branch whose head has the newest **committer** date and reports that commit's **author** name and email.
 - **Errors:** an `HTTPError` for one repo is ignored; that repo is listed without a commit.
+
+### 2b. List commits of a branch
+
+```
+GET https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repoId}/commits
+    ?searchCriteria.itemVersion.version={branch}
+    &searchCriteria.itemVersion.versionType=branch
+    &searchCriteria.fromDate={since, e.g. 2025-03-01T00:00:00Z}
+    &searchCriteria.$top=1000
+    &searchCriteria.$skip={0, 1000, ...}
+    &api-version=7.1
+```
+
+- **Method:** `commits_since` (called by `list_commits_since` once per repo, in parallel)
+- **Used by:** `repos --days N --author NAME`
+- **Response fields read:** `value[].commitId`, `committer.date`, `author.name`, `author.email`, `comment` (first line only)
+- **Logic:** the tool first reads the branch statistics (call 2) of each repo that passed the `--days` filter. It then reads commits only for branches whose head commit is within the time window, newest head first, and pages with `$skip` until a page has fewer than 1,000 commits. A commit that is on several branches is listed once, with the first branch it was found on. Author names are resolved to common names (aliases, then call 12) and compared with `--author`, case-insensitive.
+- **Notes:** `--author` is only accepted together with `--days`, which limits both the repos and the branches that are read. `comment` may be truncated by the server (`commentTruncated`); only its first line is shown.
+- **Errors:** an `HTTPError` for one repo is ignored; that repo's commits are left out.
 
 ### 3. List branches
 
@@ -231,7 +250,7 @@ GET https://vssps.dev.azure.com/{org}/_apis/identities
 ```
 
 - **Method:** `display_name` (called by `resolve_authors` once per distinct email, in parallel)
-- **Used by:** `repos --sort commit`, `authors`
+- **Used by:** `repos --sort commit`, `repos --author`, `authors`
 - **Response fields read:** `value[0].providerDisplayName`
 - **Notes:** this endpoint is on the `vssps` host, not `dev.azure.com`. Emails that already match an entry in `[aliases]` (by email or author name) are not looked up. An `HTTPError` or `PermissionError` (for example, a PAT without **Identity: Read**) is ignored, and the tool falls back to the git author name.
 
@@ -242,7 +261,8 @@ GET https://vssps.dev.azure.com/{org}/_apis/identities
 | Command | Calls |
 |---|---|
 | `repos` | 1 |
-| `repos --sort commit` | 1, then 2 per repo, then 12 per new email |
+| `repos --sort commit`, `repos --days` | 1, then 2 per repo, then 12 per new email |
+| `repos --days N --author NAME` | 1, 2 per repo; then for each repo with a recent commit: 2 again and 2b per recent branch (and page); 12 per new email |
 | `authors [repo]` | 1, then 6 per repo, then 12 per new email |
 | `workitems` | 7, 8 per 200 items; if there are items: 9, then 10 and 11 per team |
 | `branches REPO` | 3 |

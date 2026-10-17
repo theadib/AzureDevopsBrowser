@@ -5,7 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -38,6 +38,33 @@ class ClientTest(unittest.TestCase):
             {"value": [{"name": "A", "id": "id-1"}, {"name": "fork", "id": "id-3"}, {"name": "B", "id": "id-2"}]}
         )
         self.assertEqual(client.list_repos(), [{"name": "A", "id": "id-1"}])
+
+    def test_commits_since_reads_recent_branches_once_per_commit(self):
+        def head(name, date):
+            return {"name": name, "commit": {"committer": {"date": date}, "author": {"name": "x", "email": "x"}}}
+
+        def commit(cid, date, author="Jane"):
+            return {"commitId": cid, "committer": {"date": date}, "comment": f"msg {cid}\nbody",
+                    "author": {"name": author, "email": f"{author.lower()}@corp.com"}}
+
+        self.session.request.side_effect = [
+            fake_response({"value": [head("main", "2025-03-05T10:00:00Z"), head("dev", "2025-03-06T10:00:00Z"),
+                                     head("old", "2024-01-01T10:00:00Z")]}),
+            fake_response({"value": [commit("c3", "2025-03-06T10:00:00Z"), commit("c1", "2025-03-04T10:00:00Z")]}),
+            fake_response({"value": [commit("c2", "2025-03-05T10:00:00Z", "Bob"), commit("c1", "2025-03-04T10:00:00Z")]}),
+        ]
+        since = adobrowser.parse_date("2025-03-01T00:00:00Z")
+        commits = self.client.commits_since("R", since)
+        self.assertEqual([(c.id, c.branch, c.author, c.message) for c in commits], [
+            ("c3", "dev", "Jane", "msg c3"), ("c2", "main", "Bob", "msg c2"), ("c1", "dev", "Jane", "msg c1"),
+        ])
+        # Branch statistics, then dev (newest head) and main; "old" is not read
+        calls = self.session.request.call_args_list
+        self.assertEqual(len(calls), 3)
+        params = calls[1].kwargs["params"]
+        self.assertEqual(calls[1].args[1], "https://dev.azure.com/my-org/my-project/_apis/git/repositories/R/commits")
+        self.assertEqual(params["searchCriteria.itemVersion.version"], "dev")
+        self.assertEqual(params["searchCriteria.fromDate"], "2025-03-01T00:00:00Z")
 
     def test_branches_strip_prefix(self):
         self.session.request.return_value = fake_response(
@@ -290,6 +317,46 @@ class CliTest(unittest.TestCase):
             adobrowser.main(["--org", "my-org", "--project", "my-project", "repos"])
         self.assertIn("MyRepo", out.getvalue())
         self.assertIn("main", out.getvalue())
+
+    def test_repos_days_keeps_recent_commits_only(self):
+        now = adobrowser.datetime.now(adobrowser.timezone.utc)
+        recent = adobrowser.LastCommit(now - adobrowser.timedelta(days=2), "main", "Jane", "jane@corp.com")
+        old = adobrowser.LastCommit(now - adobrowser.timedelta(days=40), "main", "Bob", "bob@corp.com")
+        results = [({"name": "Zeta", "webUrl": "z"}, recent), ({"name": "Old", "webUrl": "o"}, old),
+                   ({"name": "Alpha", "webUrl": "a"}, recent), ({"name": "Empty", "webUrl": "e"}, None)]
+        out = io.StringIO()
+        with mock.patch.object(adobrowser, "make_session"), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "list_repos_by_commit", return_value=results), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "resolve_authors",
+                                  return_value={("Jane", "jane@corp.com"): "Jane Doe"}), \
+                redirect_stdout(out):
+            adobrowser.main(["--config", "/nonexistent/config.ini", "--org", "my-org",
+                             "--project", "my-project", "repos", "--days", "7"])
+        self.assertEqual([line.split()[0] for line in out.getvalue().splitlines()], ["Alpha", "Zeta"])
+
+    def test_repos_author_lists_commits_of_common_name(self):
+        now = adobrowser.datetime.now(adobrowser.timezone.utc)
+        last = adobrowser.LastCommit(now, "main", "Jane", "jane@corp.com")
+        repo = {"name": "Web", "id": "w", "webUrl": "w"}
+        commits = [(repo, adobrowser.Commit(now, "dev", "jd", "jane@home.org", "abcdef123456", "Fix login")),
+                   (repo, adobrowser.Commit(now, "main", "Bob", "bob@corp.com", "0123456789ab", "Other"))]
+        names = {("jd", "jane@home.org"): "Jane Doe", ("Bob", "bob@corp.com"): "Bob"}
+        out = io.StringIO()
+        with mock.patch.object(adobrowser, "make_session"), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "list_repos_by_commit", return_value=[(repo, last)]), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "list_commits_since", return_value=commits), \
+                mock.patch.object(adobrowser.AzureDevOpsClient, "resolve_authors", return_value=names), \
+                redirect_stdout(out):
+            adobrowser.main(["--config", "/nonexistent/config.ini", "--org", "my-org",
+                             "--project", "my-project", "repos", "--days", "7", "--author", "jane doe"])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        for text in ("Web", "dev", "abcdef12", "Fix login"):
+            self.assertIn(text, lines[0])
+
+    def test_repos_author_requires_days(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            adobrowser.main(["--org", "o", "--project", "p", "repos", "--author", "Jane Doe"])
 
     def test_authors_summary_merges_aliases_and_lists_repos(self):
         counts = {("Jane", "jane@corp.com"): {"Web": 3, "api": 1},
